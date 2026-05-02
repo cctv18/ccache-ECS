@@ -1,0 +1,194 @@
+name: Release (Simple)
+on:
+  workflow_dispatch:
+    inputs:
+      test_tag:
+        description: 'release ver (optional)'
+        required: false
+        type: string
+        default: ''
+
+env:
+  CTEST_OUTPUT_ON_FAILURE: ON
+  VERBOSE: 1
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  build_linux_aarch64_binary_glibc:
+    timeout-minutes: 30
+    name: Linux aarch64 binary (glibc)
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Prepare environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Get source
+        uses: actions/checkout@v6
+      - name: Build binary
+        env:
+          CMAKE_GENERATOR: Ninja
+          CMAKE_PARAMS: |
+            -D CMAKE_TOOLCHAIN_FILE=../toolchains/aarch64-linux-gnu.cmake
+            -D CMAKE_EXE_LINKER_FLAGS_INIT=-static-libstdc++
+        run: ci/build-binary
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-aarch64-glibc-binary
+          path: install/ccache
+
+  build_linux_x86_64_binary_glibc:
+    timeout-minutes: 30
+    name: Linux x86_64 binary (glibc)
+    runs-on: ubuntu-22.04
+    container:
+      image: almalinux:8
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Prepare environment
+        run: |
+          dnf install -y dnf-plugins-core
+          dnf config-manager --set-enabled powertools
+          dnf install -y epel-release
+          dnf install -y \
+            --setopt=install_weak_deps=False \
+            --setopt=tsflags=nodocs \
+            cmake \
+            gcc \
+            gcc-c++ \
+            gcc-toolset-11 \
+            git \
+            ninja-build
+      - name: Get source
+        uses: actions/checkout@v6
+      - name: Build binary
+        env:
+          CMAKE_GENERATOR: Ninja
+          CMAKE_PARAMS: -D CMAKE_EXE_LINKER_FLAGS_INIT=-static-libstdc++
+        run: |
+          scl enable gcc-toolset-11 ci/build-binary
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64-glibc-binary
+          path: install/ccache
+
+  build_linux_musl_static_binary:
+    timeout-minutes: ${{ matrix.qemu && 60 || 30 }}
+    name: Linux ${{ matrix.arch }} binary (musl static)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+          - arch: x86_64
+            runner: ubuntu-22.04
+    steps:
+      - name: Get source
+        uses: actions/checkout@v6
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+      - name: Trigger build
+        id: trigger
+        run: |
+          set -x
+          # If ref_type is a tag, always trigger
+          if ${{ github.ref_type == 'tag' || github.event.inputs.test_tag != '' }}; then
+            echo "trigger-build=true" >> $GITHUB_OUTPUT
+
+          # If ref_type is a branch, maybe trigger
+          elif ${{ github.ref_type == 'branch' }}; then
+            case "${{ github.ref_name }}" in
+              # If default branch, trigger
+              ${{ github.event.repository.default_branch }}) echo "trigger-build=true" >> $GITHUB_OUTPUT ;;
+              # If release branch, trigger
+              *-maint) echo "trigger-build=true" >> $GITHUB_OUTPUT ;;
+              # Unknown branch, no trigger
+              *) echo "trigger-build=false" >> $GITHUB_OUTPUT ;;
+            esac
+
+          # If ref_type is unknown, no trigger
+          else
+            echo "trigger-build=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Build in Alpine container
+        if: ${{ !matrix.qemu || steps.trigger.outputs.trigger-build == 'true' }}
+        run: |
+          docker run --rm  -v "$PWD:/work" -w /work \
+            ${{ matrix.qemu && format('--platform linux/{0}', matrix.arch) || '' }} \
+            -e GITHUB_REF \
+            -e GITHUB_REF_NAME \
+            -e GITHUB_SHA \
+            alpine:3.23 sh -c '
+              apk add --no-cache bash cmake g++ gcc git hiredis-dev make ninja xxhash-dev zstd-dev
+              CMAKE_GENERATOR=Ninja CMAKE_PARAMS="-D CMAKE_EXE_LINKER_FLAGS_INIT=-static" ci/build-binary
+          '
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.arch }}-musl-static-binary
+          path: install/ccache
+
+  publish_ccache_release:
+    needs: 
+      - build_linux_aarch64_binary_glibc
+      - build_linux_x86_64_binary_glibc
+      - build_linux_musl_static_binary
+    if: ${{ !cancelled() }} 
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下载所有成功的 ccache 工件
+        uses: actions/download-artifact@v8
+        with:
+          pattern: linux-*
+          path: ./ccache_release
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: 设置环境变量
+        run: |
+          TIME_FORM="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+          echo "TIME_FORM=$TIME_FORM" >> $GITHUB_ENV
+          TAG_HEAD="ccache-ECS"
+          echo "TAG_HEAD=$TAG_HEAD" >> $GITHUB_ENV
+          COMMIT_LINK=https://github.com/$GITHUB_REPOSITORY/commit/$GITHUB_SHA
+          echo "COMMIT_LINK=$COMMIT_LINK" >> $GITHUB_ENV
+          if [[ ${{ github.event.inputs.test_tag }} != '' ]]; then
+            RELEASE_VER=v${{ github.event.inputs.test_tag }}
+          else
+            RELEASE_VER="$(TZ='Asia/Shanghai' date +'%y%m%d%H%M%S')"
+          fi
+          echo "RELEASE_VER=$RELEASE_VER" >> $GITHUB_ENV
+
+      - name: 创建发布
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat << 'EOF' > release_notes.md
+          ### ccache-ECS
+          - 更新时间: ${{ env.TIME_FORM }}
+          - Commit: ${{ env.COMMIT_LINK }}
+          - 更新内容: 
+          - （预留）
+          EOF
+
+          gh release create "${{ env.TAG_HEAD }}-${{ env.RELEASE_VER }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ env.TAG_HEAD }}-${{ env.RELEASE_VER }}"\
+            --notes-file release_notes.md \
+            ccache_release/*
